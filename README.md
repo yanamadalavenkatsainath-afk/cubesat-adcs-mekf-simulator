@@ -118,7 +118,7 @@ See `requirements.txt`. Core libraries: `numpy`, `matplotlib`, `pandas`.
 
 ---
 
-# Final working parameters — add these to your README tuning table
+# Final working parameters 
 h_max = 0.5       # N·m·s
 Kp = 0.3
 Kd = 0.8
