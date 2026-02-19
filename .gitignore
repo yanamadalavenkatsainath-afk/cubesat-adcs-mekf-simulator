@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+.Python
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# Output / generated files
+telemetry.csv
+*.csv
+*.log
+
+# Jupyter notebooks (if used)
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
