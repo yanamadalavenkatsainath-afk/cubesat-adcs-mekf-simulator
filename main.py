@@ -22,11 +22,32 @@ from environment.solar_radiation_pressure import SolarRadiationPressure
 from environment.aerodynamic_drag import AerodynamicDrag
 from fsw.mode_manager import ModeManager, Mode
 
+# ── Relative Navigation extension ────────────────────────────────────
+from environment.cw_dynamics import CWDynamics
+from sensors.ranging_sensor import RangingBearingSensor
+from estimation.cw_ekf import CWEKF
+from control.rendezvous_controller import RendezvousController, RelNavMode
+
 modules_to_clear = [key for key in sys.modules.keys()
                     if 'estimation' in key or 'sensors' in key
                     or 'actuators' in key or 'plant' in key]
 for mod in modules_to_clear:
     sys.modules.pop(mod, None)
+
+# =====================================================
+# ──  MASTER SWITCH  ──────────────────────────────────
+# Set True to run relative navigation / formation sim
+# Set False for original single-spacecraft ADCS only
+RELATIVE_NAV = True
+
+# Relative nav scenario:
+#   'formation'  — hold a fixed trailing position (100 m along-track)
+#   'rendezvous' — start in formation, then switch to rendezvous at t=RDV_START_T
+#   'both'       — formation hold, then auto-switch to rendezvous
+RELNAV_SCENARIO  = 'both'
+RDV_START_T      = 1200.0     # s — time to trigger rendezvous maneuver
+FORMATION_OFFSET = np.array([0.0, 100.0, 0.0])   # m — initial formation position
+# ─────────────────────────────────────────────────────────────────────
 
 # =====================================================
 # Hardware Parameters — 3U CubeSat
@@ -56,7 +77,7 @@ mag_field  = MagneticField(epoch_year=2025.0)
 sun_model  = SunModel(epoch_year=2025.0)
 mag_sens   = Magnetometer()
 sun_sens   = SunSensor()
-gyro       = Gyro(dt=dt_control, bias_init_max_deg_s=0.05)  # 100 Hz — 0.05 deg/s bias matches old model
+gyro       = Gyro(dt=dt_control, bias_init_max_deg_s=0.05)
 
 rw         = ReactionWheel(h_max=0.004)
 mtq        = Magnetorquer(m_max=0.2)
@@ -74,6 +95,61 @@ q_ref      = np.array([1., 0., 0., 0.])
 t_sim_max  = 3600.0   # 60 min hard cap
 
 # =====================================================
+# ── Relative Navigation Setup ────────────────────────
+# =====================================================
+if RELATIVE_NAV:
+    # Chief orbit radius (from TLE — ISS-like ~410 km altitude)
+    R_CHIEF_KM = 6371.0 + 410.0
+
+    # CW propagator for deputy relative motion
+    cw = CWDynamics(chief_orbit_radius_km=R_CHIEF_KM)
+
+    # Initialise deputy on a Passive Safety Ellipse with along-track offset
+    # PSE: 2:1 ellipse (50 m radial × 100 m along-track), trailing at 100 m
+    cw.set_initial_offset(
+        dr_lvlh_m  = FORMATION_OFFSET,
+        dv_lvlh_ms = None   # drift-free velocity
+    )
+
+    # Ranging + bearing sensor (range noise 2m, angle noise 0.5°)
+    rng_sensor = RangingBearingSensor(
+        sigma_range_m    = 2.0,
+        sigma_range_frac = 0.005,
+        sigma_angle_rad  = np.radians(0.5),
+        fov_half_deg     = 60.0,
+        max_range_m      = 5000.0,
+    )
+
+    # CW-EKF for relative navigation
+    cw_ekf = CWEKF(n=cw.n, dt=dt_detumble)
+
+    # Seed EKF with true initial state + noise
+    init_noise = np.array([5., 5., 5., 0.05, 0.05, 0.05])
+    cw_ekf.initialise(cw.state + init_noise * np.random.randn(6))
+
+    # Rendezvous / formation hold controller
+    rel_ctrl = RendezvousController(
+        n           = cw.n,
+        mode        = RelNavMode.FORMATION_HOLD,
+        target_lvlh = FORMATION_OFFSET,
+    )
+
+    # Relative nav telemetry
+    rn_t, rn_dx, rn_dy, rn_dz        = [], [], [], []
+    rn_est_dx, rn_est_dy, rn_est_dz  = [], [], []
+    rn_range, rn_est_range            = [], []
+    rn_std_x, rn_std_y, rn_std_z     = [], [], []
+    rn_dv_total                       = []
+    rn_mode                           = []
+    rn_rdv_triggered                  = False
+
+    print("  RelNav: deputy initialised at "
+          f"[{FORMATION_OFFSET[0]:.0f}, {FORMATION_OFFSET[1]:.0f}, "
+          f"{FORMATION_OFFSET[2]:.0f}] m LVLH")
+    print(f"  RelNav: scenario = '{RELNAV_SCENARIO}', "
+          f"rdv at t={RDV_START_T:.0f}s")
+
+# =====================================================
 # Telemetry storage
 # =====================================================
 tel_t, tel_mode                     = [], []
@@ -85,20 +161,23 @@ tel_err_deg                         = []
 
 print("=" * 60)
 print("  3U CubeSat ADCS — State Machine Driven Simulation")
+if RELATIVE_NAV:
+    print("  + Relative Navigation (Clohessy-Wiltshire)")
 print("=" * 60)
 print(f"  Initial tumble: {np.degrees(np.linalg.norm(sc.omega)):.1f} deg/s")
 print()
 
 # =====================================================
-# Main simulation loop — state machine driven
+# Main simulation loop
 # =====================================================
 t = 0.0
-triad_err_deg = None   # updated each cycle during SUN_ACQUISITION
-mekf_seeded   = False  # True after MEKF is seeded on FINE_POINTING entry
-last_good_q      = None   # last TRIAD result with good geometry
-last_good_t      = -999.0 # time of last good TRIAD
-gyro_bridge      = False  # True when bridging with gyro propagation
+triad_err_deg = None
+mekf_seeded   = False
+last_good_q      = None
+last_good_t      = -999.0
+gyro_bridge      = False
 mekf_seed_t = 0.0
+
 while t < t_sim_max:
 
     # ── Sensors ──────────────────────────────────────────────────────
@@ -184,6 +263,7 @@ while t < t_sim_max:
             print(f"  MEKF seeded from sc.q")
         mekf_seeded = True
         mekf_seed_t = t
+
     # ── Actuators ─────────────────────────────────────────────────────
     if mode == Mode.SAFE_MODE:
         sc.step(np.zeros(3), disturbance, dt_detumble)
@@ -194,15 +274,12 @@ while t < t_sim_max:
         sc.step(total_torque, disturbance, dt_detumble)
 
     elif mode in (Mode.FINE_POINTING, Mode.MOMENTUM_DUMP):
-        # If MEKF attitude error still large, inject QUEST correction
-        # to pull ekf.q into the linear regime before relying on EKF updates
         q_err_check = quat_error(sc.q, ekf.q)
         if q_err_check[0] < 0:
             q_err_check = -q_err_check
         err_check = np.degrees(2 * np.linalg.norm(q_err_check[1:]))
 
         if err_check > 25.0 and last_good_q is not None:
-            # Re-run QUEST with current measurements to get fresh seed
             nadir_I  = QUEST.nadir_inertial(pos)
             nadir_b  = QUEST.nadir_body_from_earth_sensor(pos, sc.q)
             q_fresh, q_qual = quest_alg.compute_multi(
@@ -248,7 +325,59 @@ while t < t_sim_max:
                   f"P_att={np.degrees(P_att.mean()):.3f}° "
                   f"P_bias={np.degrees(P_bias.mean()):.4f}°/s")
 
-    # ── Telemetry ─────────────────────────────────────────────────────
+    # ── RELATIVE NAVIGATION ───────────────────────────────────────────
+    if RELATIVE_NAV:
+        # ── Scenario mode switching ───────────────────────────────────
+        if (RELNAV_SCENARIO in ('rendezvous', 'both')
+                and not rn_rdv_triggered
+                and t >= RDV_START_T):
+            rel_ctrl.set_mode(RelNavMode.RENDEZVOUS, t=t)
+            rn_rdv_triggered = True
+
+        # ── CW-EKF predict ────────────────────────────────────────────
+        accel_cmd, impulse_dv = rel_ctrl.compute(cw_ekf.x, t)
+        cw_ekf.predict(accel_cmd)
+
+        # ── Apply impulse to true deputy (if burn due) ────────────────
+        if impulse_dv is not None:
+            cw.apply_impulse(impulse_dv)
+            total_dv_log = cw.total_dv_ms
+            print(f"  RelNav [{t:.0f}s] Burn: Δv="
+                  f"[{impulse_dv[0]:.3f}, {impulse_dv[1]:.3f}, "
+                  f"{impulse_dv[2]:.3f}] m/s  "
+                  f"ΣΔv={total_dv_log:.3f} m/s")
+
+        # ── Propagate true deputy dynamics ────────────────────────────
+        true_state = cw.step(dt_detumble, accel_cmd)
+
+        # ── Sensor measurement ────────────────────────────────────────
+        # Sensor pointing: along-track (+y in LVLH) toward trailing deputy
+        z_meas, R_meas = rng_sensor.measure(
+            dr_lvlh              = true_state[0:3],
+            sensor_pointing_lvlh = np.array([0., 1., 0.])
+        )
+
+        # ── EKF update if measurement available ──────────────────────
+        if z_meas is not None:
+            cw_ekf.update(z_meas, R_meas)
+
+        # ── Log relative nav telemetry ────────────────────────────────
+        rn_t.append(t)
+        rn_dx.append(true_state[0])
+        rn_dy.append(true_state[1])
+        rn_dz.append(true_state[2])
+        rn_est_dx.append(cw_ekf.x[0])
+        rn_est_dy.append(cw_ekf.x[1])
+        rn_est_dz.append(cw_ekf.x[2])
+        rn_range.append(cw.range_m)
+        rn_est_range.append(np.linalg.norm(cw_ekf.position))
+        rn_std_x.append(cw_ekf.position_std[0])
+        rn_std_y.append(cw_ekf.position_std[1])
+        rn_std_z.append(cw_ekf.position_std[2])
+        rn_dv_total.append(cw.total_dv_ms)
+        rn_mode.append(rel_ctrl.mode.value)
+
+    # ── Chief telemetry ────────────────────────────────────────────────
     tel_t.append(t)
     tel_mode.append(mode.value)
     tel_wx.append(np.degrees(sc.omega[0]))
@@ -267,6 +396,7 @@ while t < t_sim_max:
     t += dt_detumble
 
 print(f"t={t:.0f} P_cross={ekf.P[0:3, 3:6]}")
+
 # =====================================================
 # Summary
 # =====================================================
@@ -287,14 +417,22 @@ if tel_err_deg:
     errs = [e for _, e in tel_err_deg]
     print(f"  Estimation error (fine pointing): "
           f"mean={np.mean(errs):.3f}°, max={np.max(errs):.3f}°")
+if RELATIVE_NAV:
+    print(f"  Relative Nav:")
+    print(f"    Final range     : {rn_range[-1]:.2f} m")
+    print(f"    Total delta-V   : {cw.total_dv_ms:.4f} m/s")
+    est_err = np.sqrt((np.array(rn_dx)-np.array(rn_est_dx))**2
+                    + (np.array(rn_dy)-np.array(rn_est_dy))**2
+                    + (np.array(rn_dz)-np.array(rn_est_dz))**2)
+    print(f"    CW-EKF pos err  : mean={np.mean(est_err):.2f} m, "
+          f"max={np.max(est_err):.2f} m")
 
 # =====================================================
-# Plots
+# Plots — Chief ADCS
 # =====================================================
 plt.rcParams.update({"font.size": 11, "axes.grid": True,
                       "grid.alpha": 0.35, "lines.linewidth": 1.2})
 
-# Mode colour bands for all plots
 MODE_COLORS = {
     Mode.SAFE_MODE.value:       ('red',       'SAFE'),
     Mode.DETUMBLE.value:        ('royalblue', 'DETUMBLE'),
@@ -304,7 +442,6 @@ MODE_COLORS = {
 }
 
 def add_mode_bands(ax, t_arr, mode_arr):
-    """Shade background by FSW mode."""
     t_arr    = np.array(t_arr)
     mode_arr = np.array(mode_arr)
     changes  = np.where(np.diff(mode_arr))[0]
@@ -315,9 +452,8 @@ def add_mode_bands(ax, t_arr, mode_arr):
         col, _ = MODE_COLORS.get(m, ('gray', '?'))
         ax.axvspan(t_arr[s], t_arr[e-1], alpha=0.08, color=col, linewidth=0)
 
-# ── Figure 1: Full mission overview ──────────────────────────────────
 fig1, axes1 = plt.subplots(2, 3, figsize=(18, 9))
-fig1.suptitle("3U CubeSat ADCS — Full Mission (State Machine)",
+fig1.suptitle("3U CubeSat ADCS — Full Mission (Chief)",
               fontsize=13, fontweight='bold')
 
 t_arr = np.array(tel_t)
@@ -361,7 +497,6 @@ ax.set_xlabel("Time [s]"); ax.set_ylabel("Density [kg/m³]")
 ax.set_title("Atmospheric Density (NRLMSISE-00)")
 
 ax = axes1[1, 2]
-# Mode timeline
 mode_arr = np.array(tel_mode)
 ax.step(t_arr, mode_arr, color='black', linewidth=1.5)
 for val, (col, label) in MODE_COLORS.items():
@@ -376,7 +511,6 @@ ax.set_title("FSW Mode Timeline"); ax.legend(fontsize=7, loc='right')
 
 fig1.tight_layout()
 
-# ── Figure 2: Estimation error (fine pointing only) ──────────────────
 if tel_err_deg:
     t_err  = [x[0] for x in tel_err_deg]
     e_err  = [x[1] for x in tel_err_deg]
@@ -387,5 +521,126 @@ if tel_err_deg:
     ax2.set_title("MEKF Attitude Estimation Error — Fine Pointing Phase")
     ax2.legend(fontsize=9)
     fig2.tight_layout()
+
+# =====================================================
+# Plots — Relative Navigation
+# =====================================================
+if RELATIVE_NAV and rn_t:
+    rn_t_arr     = np.array(rn_t)
+    rn_dx_arr    = np.array(rn_dx)
+    rn_dy_arr    = np.array(rn_dy)
+    rn_dz_arr    = np.array(rn_dz)
+    rn_edx_arr   = np.array(rn_est_dx)
+    rn_edy_arr   = np.array(rn_est_dy)
+    rn_edz_arr   = np.array(rn_est_dz)
+    rn_std_x_arr = np.array(rn_std_x)
+    rn_std_y_arr = np.array(rn_std_y)
+    rn_std_z_arr = np.array(rn_std_z)
+    pos_err_arr  = np.sqrt((rn_dx_arr - rn_edx_arr)**2
+                         + (rn_dy_arr - rn_edy_arr)**2
+                         + (rn_dz_arr - rn_edz_arr)**2)
+
+    RELNAV_COLORS = {
+        RelNavMode.FORMATION_HOLD.value:  ('steelblue', 'FORM HOLD'),
+        RelNavMode.RENDEZVOUS.value:      ('crimson',   'RENDEZVOUS'),
+        RelNavMode.STATION_KEEPING.value: ('green',     'STN KEEP'),
+        RelNavMode.COASTING.value:        ('gray',      'COASTING'),
+    }
+
+    def add_rn_bands(ax):
+        rn_mode_arr = np.array(rn_mode)
+        changes  = np.where(np.diff(rn_mode_arr))[0]
+        segments = np.concatenate([[0], changes + 1, [len(rn_mode_arr)]])
+        for i in range(len(segments) - 1):
+            s, e = segments[i], segments[i+1]
+            m    = rn_mode_arr[s]
+            col, lbl = RELNAV_COLORS.get(m, ('gray', '?'))
+            ax.axvspan(rn_t_arr[s], rn_t_arr[e-1],
+                       alpha=0.10, color=col, linewidth=0)
+
+    fig3, axes3 = plt.subplots(2, 3, figsize=(18, 9))
+    fig3.suptitle("Relative Navigation — CW Dynamics + EKF",
+                  fontsize=13, fontweight='bold')
+
+    # ── Relative position components ─────────────────────────────────
+    ax = axes3[0, 0]
+    ax.plot(rn_t_arr, rn_dx_arr,  color='royalblue',  label="δx true (radial)")
+    ax.plot(rn_t_arr, rn_edx_arr, color='royalblue',
+            linestyle='--', alpha=0.6, label="δx est")
+    ax.fill_between(rn_t_arr,
+                    rn_edx_arr - 3*rn_std_x_arr,
+                    rn_edx_arr + 3*rn_std_x_arr,
+                    alpha=0.15, color='royalblue', label="3σ")
+    add_rn_bands(ax)
+    ax.set_xlabel("Time [s]"); ax.set_ylabel("δx [m]")
+    ax.set_title("Radial (δx)"); ax.legend(fontsize=8)
+
+    ax = axes3[0, 1]
+    ax.plot(rn_t_arr, rn_dy_arr,  color='darkorange', label="δy true (along-track)")
+    ax.plot(rn_t_arr, rn_edy_arr, color='darkorange',
+            linestyle='--', alpha=0.6, label="δy est")
+    ax.fill_between(rn_t_arr,
+                    rn_edy_arr - 3*rn_std_y_arr,
+                    rn_edy_arr + 3*rn_std_y_arr,
+                    alpha=0.15, color='darkorange', label="3σ")
+    add_rn_bands(ax)
+    ax.set_xlabel("Time [s]"); ax.set_ylabel("δy [m]")
+    ax.set_title("Along-Track (δy)"); ax.legend(fontsize=8)
+
+    ax = axes3[0, 2]
+    ax.plot(rn_t_arr, rn_dz_arr,  color='green', label="δz true (cross-track)")
+    ax.plot(rn_t_arr, rn_edz_arr, color='green',
+            linestyle='--', alpha=0.6, label="δz est")
+    ax.fill_between(rn_t_arr,
+                    rn_edz_arr - 3*rn_std_z_arr,
+                    rn_edz_arr + 3*rn_std_z_arr,
+                    alpha=0.15, color='green', label="3σ")
+    add_rn_bands(ax)
+    ax.set_xlabel("Time [s]"); ax.set_ylabel("δz [m]")
+    ax.set_title("Cross-Track (δz)"); ax.legend(fontsize=8)
+
+    # ── Range ─────────────────────────────────────────────────────────
+    ax = axes3[1, 0]
+    ax.plot(rn_t_arr, np.array(rn_range),     color='purple', label="True range")
+    ax.plot(rn_t_arr, np.array(rn_est_range), color='purple',
+            linestyle='--', alpha=0.6, label="EKF range est")
+    if RDV_START_T < t_sim_max:
+        ax.axvline(RDV_START_T, color='crimson', linestyle=':',
+                   linewidth=1.5, label=f"Rendezvous starts")
+    add_rn_bands(ax)
+    ax.set_xlabel("Time [s]"); ax.set_ylabel("Range [m]")
+    ax.set_title("Inter-Spacecraft Range"); ax.legend(fontsize=8)
+
+    # ── EKF estimation error ──────────────────────────────────────────
+    ax = axes3[1, 1]
+    ax.plot(rn_t_arr, pos_err_arr, color='crimson', label="|pos error|")
+    ax.axhline(10.0, color='gray', linestyle=':', label="10 m ref")
+    add_rn_bands(ax)
+    ax.set_xlabel("Time [s]"); ax.set_ylabel("Position Error [m]")
+    ax.set_title("CW-EKF Position Estimation Error"); ax.legend(fontsize=8)
+
+    # ── Relative trajectory (δx vs δy — LVLH plane) ──────────────────
+    ax = axes3[1, 2]
+    sc_traj = ax.scatter(rn_dy_arr, rn_dx_arr,
+                         c=rn_t_arr, cmap='viridis', s=3, zorder=3)
+    ax.plot(0, 0, 'k*', markersize=14, label="Chief", zorder=5)
+    ax.plot(rn_dy_arr[0], rn_dx_arr[0], 'go', markersize=8,
+            label="Deputy start", zorder=4)
+    ax.plot(rn_dy_arr[-1], rn_dx_arr[-1], 'rs', markersize=8,
+            label="Deputy end", zorder=4)
+    plt.colorbar(sc_traj, ax=ax, label="Time [s]")
+    ax.set_xlabel("δy — Along-Track [m]")
+    ax.set_ylabel("δx — Radial [m]")
+    ax.set_title("LVLH Relative Trajectory"); ax.legend(fontsize=8)
+    ax.set_aspect('equal', adjustable='datalim')
+
+    # ── Legend for mode bands ─────────────────────────────────────────
+    from matplotlib.patches import Patch
+    legend_patches = [Patch(facecolor=c, alpha=0.4, label=l)
+                      for _, (c, l) in RELNAV_COLORS.items()]
+    fig3.legend(handles=legend_patches, loc='lower center',
+                ncol=4, fontsize=9, title="RelNav Mode")
+
+    fig3.tight_layout(rect=[0, 0.04, 1, 1])
 
 plt.show()
