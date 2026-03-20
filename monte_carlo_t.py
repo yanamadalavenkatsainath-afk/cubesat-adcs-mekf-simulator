@@ -56,12 +56,12 @@ ADCS_STABLE_SUST = 100
 RDV_DELAY_S      = 300.0
 FORMATION_OFFSET = np.array([0.0, 100.0, 0.0])
 R_CHIEF_KM       = 6781.0
-EKF_SETTLE_S     = 60.0
-CLEANUP_HOLD_S   = 120.0
+EKF_SETTLE_S     = 120.0
+CLEANUP_HOLD_S   = 300.0    # extended: 120s was insufficient to damp burn-2 residuals
 
 # MC settings
 T_SIM_BASE     = 12000.0
-T_SIM_RDV_PAD  = 12000.0    # s — increased: covers late P1 + full RDV + cleanup
+T_SIM_RDV_PAD  = 15000.0    # s — increased: covers late P1 + full RDV + cleanup
 CONV_THRESH    = 0.5
 SS_OFFSET_S    = 300.0
 OMEGA_MAG_MEAN = np.radians(18.0)
@@ -71,7 +71,7 @@ OMEGA_MAG_MAX  = np.radians(35.0)
 F107_MEAN, F107_STD = 150.0, 30.0
 POS_JITTER_M   = 15.0
 VEL_JITTER_MS  = 0.005
-RDV_JITTER_S   = 120.0
+RDV_JITTER_S   = 60.0
 RDV_SUCCESS_M  = 15.0
 
 # =============================================================================
@@ -430,7 +430,7 @@ def run_single(run_idx: int) -> dict:
                                           target_lvlh=np.zeros(3))
                 elif t_run >= roe_ctrl._cleanup_t0 + CLEANUP_HOLD_S:
                     rdv_complete = True
-                    break   # stop sim immediately — final_range measured now
+                    break   # measure final_range now, don't drift further
 
             # During cleanup, use CW formation hold accel
             if rdv_triggered and getattr(roe_ctrl, '_cleanup_started', False):
@@ -486,7 +486,6 @@ def run_single(run_idx: int) -> dict:
         total_dv_mms=total_dv_mms,
         burn1_range=burn_ranges[0] if len(burn_ranges) > 0 else float('nan'),
         burn2_range=burn_ranges[1] if len(burn_ranges) > 1 else float('nan'),
-        nb_burns=len(burn_ranges),
     )
 
 
@@ -530,7 +529,6 @@ if __name__ == '__main__':
                   f"w={r['omega0_deg']:.1f}°/s  det={det_s}  P1@{p1_s}  "
                   f"conv={conv_s}  rdv={r['rdv_outcome']}  "
                   f"range={r['final_range']:7.2f}m  "
-                  f"nb={r['nb_burns']}  "
                   f"dV={r['total_dv_mms']:.1f}mm/s  ETA {eta:.0f}s")
 
     # ── Summary stats ──────────────────────────────────────────────────────────

@@ -40,11 +40,20 @@ class ModeManager:
 
     # ── Transition thresholds ─────────────────────────────────────────
     SAFE_RATE_THRESHOLD   = np.radians(40.0)   # rad/s — above this → SAFE_MODE
-    DETUMBLE_THRESHOLD    = np.radians(3.5)   # rad/s = 2.9 deg/s exit condition
+    DETUMBLE_THRESHOLD    = np.radians(3.5)    # rad/s = 2.9 deg/s exit condition
     TRIAD_ERR_THRESHOLD   = 15.0               # deg — TRIAD accepted below this
     SUN_ACQ_TIMEOUT       = 600.0              # s — give up sun acq after this long
-    DUMP_TRIGGER          = 0.0015              # N·m·s — start dump above this |h|
-    DUMP_COMPLETE         = 0.0008              # N·m·s — end dump below this |h|
+
+    # Momentum dump thresholds — set at 75% / 20% of h_max (0.004 N·m·s).
+    # Wide hysteresis prevents rapid FINE_POINTING <-> MOMENTUM_DUMP cycling:
+    # at small pointing errors the controller commands ~1-10 uNm, which fills
+    # the old 0.7 mNms band in seconds.  A 2.2 mNms band takes ~200 s to refill.
+    DUMP_TRIGGER          = 0.003              # N·m·s — start dump above this |h|  (75% h_max)
+    DUMP_COMPLETE         = 0.0008             # N·m·s — end dump below this |h|    (20% h_max)
+
+    # Only enter MOMENTUM_DUMP when pointing is already good (deg).
+    # Prevents thrashing: large pointing errors cause large wheel torques -> instant re-trigger.
+    DUMP_POINTING_GUARD   = 5.0                # deg — skip dump entry if err > this
 
     def __init__(self):
         self.mode           = Mode.DETUMBLE
@@ -53,6 +62,7 @@ class ModeManager:
         self.fault_flags    = set()
 
         self.triad_err_deg     = None
+        self.pointing_err_deg  = None   # last known MEKF pointing error
 
         # History for telemetry/plotting
         self.mode_history   = []   # list of (t, mode) tuples
@@ -63,17 +73,20 @@ class ModeManager:
     # Main update — call once per control cycle
     # ─────────────────────────────────────────────────────────────────
 
-    def update(self, t, omega, wheel_h, triad_err_deg=None, fault=False):
+    def update(self, t, omega, wheel_h, triad_err_deg=None, fault=False,
+               pointing_err_deg=None):
         """
         Evaluate transition conditions and update mode.
 
         Parameters
         ----------
-        t             : simulation time [s]
-        omega         : angular rate vector [rad/s]
-        wheel_h       : reaction wheel momentum vector [N·m·s]
-        triad_err_deg : TRIAD initialisation error [deg], None if not run
-        fault         : external fault flag
+        t                : simulation time [s]
+        omega            : angular rate vector [rad/s]
+        wheel_h          : reaction wheel momentum vector [N·m·s]
+        triad_err_deg    : TRIAD initialisation error [deg], None if not run
+        fault            : external fault flag
+        pointing_err_deg : current MEKF pointing error [deg], used to gate
+                           MOMENTUM_DUMP entry (avoids thrashing when off-target)
 
         Returns
         -------
@@ -81,6 +94,9 @@ class ModeManager:
         """
         rate  = np.linalg.norm(omega)
         h_max = np.max(np.abs(wheel_h))
+
+        if pointing_err_deg is not None:
+            self.pointing_err_deg = pointing_err_deg
 
         # ── Fault / safe mode — highest priority ─────────────────────
         if fault or rate > self.SAFE_RATE_THRESHOLD:
@@ -124,7 +140,12 @@ class ModeManager:
 
         # ── FINE_POINTING ↔ MOMENTUM_DUMP ────────────────────────────
         if self.mode == Mode.FINE_POINTING:
-            if h_max > self.DUMP_TRIGGER:
+            # Only trigger dump when pointing is already settled.
+            # If the spacecraft is still converging, large attitude-control
+            # torques would immediately re-saturate the wheels.
+            pointing_ok = (self.pointing_err_deg is None or
+                           self.pointing_err_deg < self.DUMP_POINTING_GUARD)
+            if h_max > self.DUMP_TRIGGER and pointing_ok:
                 self._transition(Mode.MOMENTUM_DUMP, t)
             return self.mode
 

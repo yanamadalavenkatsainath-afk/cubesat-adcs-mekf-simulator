@@ -4,20 +4,25 @@ Corrected RW momentum coupling.
 
 The equation of motion for a spacecraft with reaction wheels is:
 
-    (I_sc + I_rw) · ω̇  =  τ_ext  -  τ_rw_cmd  -  ω × (I_sc·ω + h_rw)
+    (I_sc) · ω̇  =  τ_ext  -  τ_rw_cmd  -  ω × (I_sc·ω + h_rw)
 
 Where:
     I_sc     = spacecraft bus inertia (constant, wheels are part of the body)
     τ_ext    = external torques (MTQ, drag, GG, SRP)
-    τ_rw_cmd = torque commanded TO the wheels (reaction torque ON body = -τ_cmd)
+    τ_rw_cmd = torque commanded TO the wheels; reaction on body = -τ_rw_cmd
+               (Newton 3rd law: body loses momentum equal to what wheel gains)
     h_rw     = total angular momentum stored in wheels [N·m·s]
     ω × h_rw = gyroscopic coupling term (critical for accuracy)
 
 The key sign convention:
     Wheels exert -τ_cmd on the body (Newton 3rd law).
-    This is the tau_rw subtraction in omega_dot.
+    τ_rw_cmd is therefore SUBTRACTED in omega_dot.
     Do NOT also add τ_cmd to tau_ext — that double-counts it.
-    
+
+    Because the reaction wheel subtracts from the body, the attitude
+    controller must output a POSITIVE desired correction torque, which
+    the wheel then opposes with equal magnitude.
+
     Correct call:  sc.step(torque_mtq, disturbance, dt, tau_rw=torque_rw)
     Wrong call:    sc.step(torque_rw + torque_mtq, disturbance, dt)  ← old code
 
@@ -43,7 +48,8 @@ class Spacecraft:
     def omega_dot(self, omega, tau_ext, tau_rw_cmd, h_rw):
         gyro_sc = np.cross(omega, self.I @ omega)
         gyro_rw = np.cross(omega, h_rw)
-        return self.I_inv @ (tau_ext + tau_rw_cmd - gyro_sc - gyro_rw)
+        # Newton 3rd: wheel exerts -tau_rw_cmd reaction on body (M&C Eq. 7.108)
+        return self.I_inv @ (tau_ext - tau_rw_cmd - gyro_sc - gyro_rw)
 
     def quat_dot(self, q, omega):
         wx, wy, wz = omega

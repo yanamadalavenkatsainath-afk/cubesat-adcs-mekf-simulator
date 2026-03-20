@@ -266,11 +266,13 @@ class RendezvousController:
         if self._rdv_T is None:
             # Scan transfer time fractions to find well-conditioned solution.
             # Phi_rv is singular at nt = k*pi — avoid those.
-            # Pick the transfer time with minimum total delta-V.
-            T_orb = 2.0 * np.pi / self.n
+            # Pick the transfer time with minimum total delta-V subject to
+            # a hard cap on |dv1| (prevents runaway burns from stale EKF state).
+            T_orb  = 2.0 * np.pi / self.n
+            DV_CAP = 0.10   # m/s — any individual burn above this is rejected
             best_T, best_dv1, best_dv2, best_total = None, None, None, np.inf
 
-            for frac in np.linspace(0.15, 0.95, 40):
+            for frac in np.linspace(0.15, 0.95, 80):   # finer scan
                 T_try  = frac * T_orb
                 nt_try = self.n * T_try
                 k_near = round(nt_try / np.pi)
@@ -280,6 +282,11 @@ class RendezvousController:
                 if result[0] is None:
                     continue
                 dv1_try, dv2_try = result
+                # Reject solutions with runaway individual burns
+                if np.linalg.norm(dv1_try) > DV_CAP:
+                    continue
+                if np.linalg.norm(dv2_try) > DV_CAP:
+                    continue
                 total_try = np.linalg.norm(dv1_try) + np.linalg.norm(dv2_try)
                 if total_try < best_total:
                     best_total = total_try
@@ -290,13 +297,13 @@ class RendezvousController:
                 self.mode = RelNavMode.FORMATION_HOLD
                 return np.zeros(3), None
 
-            self._rdv_T   = best_T
-            self._rdv_dv1 = best_dv1
-            self._rdv_dv2 = best_dv2
+            self._rdv_T          = best_T
+            self._rdv_dv1        = best_dv1
+            self._rdv_dv2        = best_dv2
             print(f"  Rendezvous planned: T={self._rdv_T/60:.1f} min, "
-                  f"|Dv1|={np.linalg.norm(best_dv1):.3f} m/s, "
-                  f"|Dv2|={np.linalg.norm(best_dv2):.3f} m/s, "
-                  f"SumDv={best_total:.3f} m/s")
+                  f"|Dv1|={np.linalg.norm(best_dv1)*1000:.2f} mm/s, "
+                  f"|Dv2|={np.linalg.norm(best_dv2)*1000:.2f} mm/s, "
+                  f"SumDv={best_total*1000:.2f} mm/s")
 
         dt_rdv = t - self._rdv_t_start
 
@@ -305,11 +312,10 @@ class RendezvousController:
             self._rdv_burn1_applied = True
             return np.zeros(3), self._rdv_dv1
 
-        # Burn 2: at T
+        # Burn 2: at scheduled T
         if (not self._rdv_burn2_applied and
-                dt_rdv >= self._rdv_T - 0.5):   # 0.5s tolerance
+                dt_rdv >= self._rdv_T - 0.5):
             self._rdv_burn2_applied = True
-            # Switch to formation hold at origin after arrival
             self.mode   = RelNavMode.COASTING
             self.target = np.zeros(3)
             return np.zeros(3), self._rdv_dv2
