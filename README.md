@@ -233,7 +233,3 @@ Available in `/docs`:
 - ECSS-E-ST-60-30C: Satellite Attitude and Orbit Control System Standard
 
 ---
-
-## License
-
-MIT License — free to use, modify, and distribute with attribution.
